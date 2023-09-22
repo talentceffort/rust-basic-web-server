@@ -1,12 +1,14 @@
 use std::{
     sync::{mpsc, Arc, Mutex},
-    thread::{self, JoinHandle},
+    thread,
 };
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: Option<mpsc::Sender<Job>>,
 }
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 impl ThreadPool {
     /// Create a new ThreadPool.
@@ -34,15 +36,35 @@ impl ThreadPool {
             workers.push(Worker::new(id, Arc::clone(&receiver)));
         }
 
-        ThreadPool { workers, sender }
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        }
     }
 
+    // 스레드간 통신을 위한 메세지 패싱을 구현.
+    // 'static은 클로저가 수명을 가지지 않고 어떤 스레드에서든 사용 가능을 의미
     pub fn execute<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static, // 클로저가 인자를 받지 않고 반환값도 없어서 FnOnce뒤에 ()사용
     {
         let job = Box::new(f);
-        self.sender.send(job).unwrap();
+        // as_ref를 사용해 Option<&Sender>로 변환
+        self.sender.as_ref().unwrap().send(job).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            // Option 의 take 메소드는 Some variant 를 빼내고 None 으로 대체
+            // Some 을 파괴하고 스레드를 얻기 위해 if let 를 사용
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
 
@@ -65,25 +87,34 @@ impl ThreadPool {
 // 3. id 숫자를 받은 Worker 인스턴스를 반환하는 Worker::new 함수를 정의. 반환된 Worker인스턴스에서는 id 와 빈 클로저르 생성된 스레드가 포함되어 있음
 // 4. ThreadPool::new 내에서 for 루프를 이용해 id를 생성하고 id를 이용해 새 Worker 를 생성한 뒤 해당 워커를 벡터안에 저장
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
 struct Worker {
     id: usize,
-    thread: JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
-        let thread = thread::spawn(move || {
+        let thread = thread::spawn(move || loop {
             // 뮤텍스를 얻기 위해 lock 호출.
             // 뮤텍스를 얻고 채널로부터 Job을 얻기 위해 recv 호출
             // receiver 가져오기 위해 move 사용
-            while let Ok(job) = receiver.lock().unwrap().recv() {
-                println!("Worker {id} got a job; executing.");
+            let message = receiver.lock().unwrap().recv();
 
-                job();
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing.");
+                    job();
+                }
+                Err(_) => {
+                    println!("Worker {id} disconnected; shutting down.");
+                    break;
+                }
             }
         });
-        Worker { id, thread }
+
+        Worker {
+            id,
+            thread: Some(thread),
+        }
     }
 }

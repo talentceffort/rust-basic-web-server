@@ -1,7 +1,6 @@
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::BufReader;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::thread;
@@ -10,19 +9,22 @@ extern crate web_server;
 use web_server::ThreadPool;
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+    let pool = ThreadPool::new(4);
 
+    // incoming 뒤에 take(2) 추가하면 반복문을 처음 2번으로 제한.
     for stream in listener.incoming() {
         let stream = stream.unwrap();
-        let pool = ThreadPool::new(4);
 
         pool.execute(|| {
-            new_handle_connection(stream);
+            handle_connection(stream);
         });
     }
+
+    println!("Shutting down.");
 }
 // 연결하기
 fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = [0; 512]; // 크기가 512이고 모든 요소가 0으로 초기화
+    let mut buffer = [0; 1024]; // 크기가 512이고 모든 요소가 0으로 초기화
     stream.read(&mut buffer).unwrap();
 
     // &[u8]을 전달받고 String으로 바꿔서 제공. lossy의 의미는 유효하지 않은 UTF-8 배열을 만났을 때의 행동을 나타냄.
@@ -63,22 +65,30 @@ fn handle_connection(mut stream: TcpStream) {
 }
 
 fn new_handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&mut stream);
-    let request_line = buf_reader.lines().next().unwrap().unwrap();
+    let mut buffer = [0; 1024];
+    stream.read(&mut buffer).unwrap();
 
-    let (status_line, filename) = match &request_line[..] {
-        "GET / HTTP/1.1" => ("HTTP/1.1 200 OK", "hello.html"),
-        "GET /sleep HTTP/1.1" => {
-            thread::sleep(Duration::from_secs(5));
-            ("HTTP/1.1 200 OK", "hello.html")
-        }
-        _ => ("HTTP/1.1 404 NOT FOUND", "404.html"),
+    let get = b"GET / HTTP/1.1\r\n";
+    let sleep = b"GET /sleep HTTP/1.1\r\n";
+
+    let (status_line, filename) = if buffer.starts_with(get) {
+        ("HTTP/1.1 200 OK", "hello.html")
+    } else if buffer.starts_with(sleep) {
+        thread::sleep(Duration::from_secs(5));
+        ("HTTP/1.1 200 OK", "hello.html")
+    } else {
+        ("HTTP/1.1 404 NOT FOUND", "404.html")
     };
 
     let contents = fs::read_to_string(filename).unwrap();
-    let length = contents.len();
 
-    let response = format!("{status_line}\r\nContent-Length: {length}\r\n\r\n{contents}");
+    let response = format!(
+        "{}\r\nContent-Length: {}\r\n\r\n{}",
+        status_line,
+        contents.len(),
+        contents
+    );
 
     stream.write_all(response.as_bytes()).unwrap();
+    stream.flush().unwrap();
 }
